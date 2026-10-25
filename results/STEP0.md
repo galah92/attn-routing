@@ -3,7 +3,7 @@
 Model `allenai/OLMoE-1B-7B-0125`, bf16, attn=`eager`, experts impl=`grouped_mm`. Config: `{'num_hidden_layers': 16, 'num_experts': 64, 'num_experts_per_tok': 8, 'norm_topk_prob': False, 'num_attention_heads': 16, 'num_key_value_heads': 16, 'hidden_size': 2048}`.
 
 ## 1. Load and forward
-- Load: 115.9 s, 12.89 GB allocated after load.
+- Load: 108.5 s, 12.89 GB allocated after load.
 - Forward 1x1024 (web), with router logits and attention hooks: peak 13.51 GB, LM loss 2.345.
 - Forward 1x2048 (headroom check): peak 14.15 GB of 24 GB.
 - Peak memory from `torch.cuda.max_memory_allocated` (nvidia-smi/NVML is broken on this host: driver/library version mismatch; CUDA itself works).

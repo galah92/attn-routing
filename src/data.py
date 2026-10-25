@@ -7,11 +7,13 @@ Documents shorter than that are skipped. The tokenizer adds no BOS, so the leadi
 
 import argparse
 import json
+import os
+import sys
 
 import numpy as np
 from datasets import load_dataset
 
-from .common import DATA, load_tokenizer
+from .common import DATA, RESULTS, SEED, load_tokenizer
 
 DOMAINS = {
     "web": ("HuggingFaceFW/fineweb-edu", "sample-10BT", "text"),
@@ -48,6 +50,32 @@ def build(n_per_domain=100, seq_len=1024):
     return path
 
 
+def hard_exit(code=0):
+    """Skip interpreter teardown: `datasets` streaming leaves native threads that abort the process
+    at finalization (PyGILState_Release fatal error) even after `del ds; gc.collect()`."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def make_split(domains, seed=SEED):
+    """50/50 head-selection / eval split, stratified by domain."""
+    rng = np.random.default_rng(seed)
+    sel, ev = [], []
+    for dom in DOMAINS:
+        idx = rng.permutation(np.where(domains == dom)[0])
+        sel += sorted(idx[: len(idx) // 2].tolist())
+        ev += sorted(idx[len(idx) // 2 :].tolist())
+    split = {"seed": seed, "selection": sorted(sel), "eval": sorted(ev)}
+    RESULTS.mkdir(exist_ok=True)
+    (RESULTS / "split.json").write_text(json.dumps(split))
+    return split
+
+
+def load_split():
+    return json.loads((RESULTS / "split.json").read_text())
+
+
 def load(seq_len=1024):
     d = np.load(DATA / f"seqs_{seq_len}.npz")
     return d["ids"], d["domains"]
@@ -59,3 +87,4 @@ if __name__ == "__main__":
     p.add_argument("--seq-len", type=int, default=1024)
     a = p.parse_args()
     build(a.n_per_domain, a.seq_len)
+    hard_exit()
