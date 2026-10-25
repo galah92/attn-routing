@@ -1,6 +1,6 @@
 """End-to-end entry point: python -m src.run_all"""
 
-from . import data, step0, step1
+from . import data, step0, step1, step2
 from .common import DATA
 
 
@@ -13,6 +13,7 @@ def main():
     data.make_split(domains)
     step0.run()
     step1.run()
+    step2.run()
     if built:
         data.hard_exit()  # streaming threads abort normal interpreter teardown
 

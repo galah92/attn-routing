@@ -34,7 +34,7 @@ def load_model():
 
 
 @contextmanager
-def capture(model, attn_fn=None, keep_router_input=False):
+def capture(model, attn_fn=None, keep_router_input=False, keep_layer_input=False):
     """Register hooks on every decoder layer for one forward pass.
 
     Records into the yielded dict:
@@ -42,10 +42,11 @@ def capture(model, attn_fn=None, keep_router_input=False):
       weights[l]: top_k_weights [n, k] actually used to mix expert outputs
       attn[l]:    attn_fn(l, attn_weights[B, H, n, n]) if attn_fn is given
       router_in[l]: hidden state fed to layer l's router (post-attention RMSNorm output)
+      layer_in[l]: residual stream entering layer l (output of layer l-1), before its attention
     The attention tensor is reduced by attn_fn inside the hook and then dropped, so only
     the reduction is kept in memory.
     """
-    rec = {"experts": {}, "weights": {}, "attn": {}, "router_in": {}}
+    rec = {"experts": {}, "weights": {}, "attn": {}, "router_in": {}, "layer_in": {}}
     handles = []
     for l, layer in enumerate(model.model.layers):
 
@@ -58,6 +59,14 @@ def capture(model, attn_fn=None, keep_router_input=False):
                 rec["router_in"][l] = vals["hidden_states"].detach()
 
         handles.append(layer.mlp.experts.register_forward_pre_hook(experts_pre, with_kwargs=True))
+
+        if keep_layer_input:
+
+            def layer_pre(mod, args, kwargs, l=l):
+                h = args[0] if args else kwargs["hidden_states"]
+                rec["layer_in"][l] = h.detach()
+
+            handles.append(layer.register_forward_pre_hook(layer_pre, with_kwargs=True))
 
         if attn_fn is not None:
 

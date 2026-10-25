@@ -1,0 +1,167 @@
+{
+  "criterion": "selection split, mean recall over B",
+  "top3_heads": {
+    "0": [
+      11,
+      7,
+      12
+    ],
+    "1": [
+      11,
+      5,
+      12
+    ],
+    "2": [
+      2,
+      10,
+      11
+    ],
+    "3": [
+      5,
+      6,
+      11
+    ],
+    "4": [
+      5,
+      0,
+      1
+    ],
+    "5": [
+      6,
+      3,
+      9
+    ],
+    "6": [
+      2,
+      7,
+      3
+    ],
+    "7": [
+      4,
+      14,
+      1
+    ],
+    "8": [
+      8,
+      1,
+      3
+    ],
+    "9": [
+      4,
+      13,
+      9
+    ],
+    "10": [
+      0,
+      6,
+      2
+    ],
+    "11": [
+      9,
+      8,
+      1
+    ],
+    "12": [
+      5,
+      0,
+      6
+    ],
+    "13": [
+      5,
+      12,
+      2
+    ],
+    "14": [
+      12,
+      4,
+      13
+    ],
+    "15": [
+      15,
+      11,
+      3
+    ]
+  },
+  "per_layer": {
+    "0": {
+      "lambda": 0.95,
+      "A_heads": "mean",
+      "B_heads": null
+    },
+    "1": {
+      "lambda": 0.95,
+      "A_heads": "mean",
+      "B_heads": "mean"
+    },
+    "2": {
+      "lambda": 0.8,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "3": {
+      "lambda": 0.9,
+      "A_heads": "mean",
+      "B_heads": "top3"
+    },
+    "4": {
+      "lambda": 0.7,
+      "A_heads": "top3",
+      "B_heads": "mean"
+    },
+    "5": {
+      "lambda": 0.7,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "6": {
+      "lambda": 0.7,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "7": {
+      "lambda": 0.7,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "8": {
+      "lambda": 0.7,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "9": {
+      "lambda": 0.7,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "10": {
+      "lambda": 0.95,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "11": {
+      "lambda": 0.7,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "12": {
+      "lambda": 0.9,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "13": {
+      "lambda": 0.9,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "14": {
+      "lambda": 0.95,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    },
+    "15": {
+      "lambda": 0.95,
+      "A_heads": "top3",
+      "B_heads": "top3"
+    }
+  }
+}
