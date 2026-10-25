@@ -1,0 +1,11 @@
+accelerate==1.15.0
+datasets==5.1.0
+huggingface-hub==2.3.0
+matplotlib==3.11.2
+numpy==2.5.4
+pandas==3.1.0
+safetensors==0.8.0
+scipy==1.18.1
+tokenizers==0.23.3
+torch==2.14.1
+transformers==5.20.2
