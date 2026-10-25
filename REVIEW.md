@@ -51,3 +51,24 @@ Before Step 1:
 - Run on 10 sequences first, check the outputs make sense, then do the full run.
 - Push after Step 1 with a short `results/STEP1.md` (headline numbers + plots) and stop, so this can be
   reviewed before Step 2.
+
+## Step 1 — approved (reviewed commit bdadbbb)
+
+Well done; the partial-ρ-given-d control was a good addition. Notes that change Step 2:
+
+1. **Sink in scores.** Per your note, j = 0 carries most long-range mass. In predictors A and B, the main
+   variant excludes j = 0 and renormalizes the remaining weights; report the with-sink variant secondary.
+2. **Per-layer heads.** For layer l, predictor A uses the top-3 heads *of layer l* from
+   `step1_best_heads.json` (selection split), averaged. Also report head-mean. In layers 11–13, where no
+   head beats the mean, head-mean is expected to win; report whichever happens.
+3. **d = 1 is attention's blind spot, recency's strength.** Add **Attention + recency**: z-scored
+   attention scores + z-scored recency scores, mixing weight tuned on the selection split. The final
+   question is then: does attention add to (a) recency and (b) pre-gating? Report gain over each with a
+   bootstrap CI over sequences.
+4. **Best combined predictor.** Also report pre-gating + recency + attention (two mixing weights,
+   small grid on the selection split). This is the number that decides whether attention is worth
+   computing.
+5. **Negative heads** (e.g. 0.4): skip for now; mention in limitations.
+6. **Lead-time summary table** in STEP2.md: one row per predictor with what it reads and when.
+
+You now have autonomy: see `CLAUDE.md`. Run Step 2 and the final report without stopping.
