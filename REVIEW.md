@@ -1,3 +1,53 @@
 # Review notes
 
-No feedback yet. Run Step 0 per TASK.md, push, and stop.
+## Step 0 — approved (reviewed commit 3e43443)
+
+Checks are correct and sufficient. Using the `mlp.experts` pre-hook `top_k_index` as ground truth is the
+right call; keep it as the source of expert sets everywhere (not top-k of the bf16 logits).
+Keep 1024 tokens per sequence.
+
+Before Step 1:
+- Run `python -m src.run_all` end-to-end once (data exists, so it should skip the build). For the crash on
+  exit in `data.py`: if it's the streaming iterator's background threads, explicitly `del ds` and call
+  `gc.collect()` per domain, or call `os._exit(0)` after saving. Note in the report which fix you used.
+- Split sequences into a **head-selection split** and an **eval split**, 50/50, stratified by domain, fixed
+  seed. Save the split to `results/split.json`. All "best heads" and any tuned parameter are chosen on the
+  selection split and reported on the eval split only.
+
+## Changes to Step 1
+
+1. **Token-identity control.** Repeated tokens (identifiers in code, repeated words) get both high
+   attention (duplicate/induction heads) and near-identical routing, especially in early layers, where
+   routing is largely token-driven. That would make attention look predictive for a trivial reason.
+   Report every within-bin correlation twice: all pairs, and pairs with `ids[t] != ids[j]`. Also report
+   the fraction of same-token pairs per bin.
+2. **Sink exclusion.** Run as planned (j = 0 excluded). Since position 0 is always `<|endoftext|>`,
+   make "exclude j = 0" the main result and the all-pairs version secondary.
+3. **Uncertainty.** Pairs within a sequence aren't independent. Compute the correlation per sequence,
+   then report the mean and a bootstrap 95% CI over sequences (1000 resamples). Report the number of
+   sequences and pairs per cell.
+4. **Pair sampling.** Sample pairs stratified per distance bin (for example up to 2000 pairs per bin per
+   sequence per layer) so short distances don't dominate. Bin 1 (d = 1) has only n − 1 pairs per sequence;
+   use all of them.
+5. **Per head.** Rank heads on the selection split by mean within-bin correlation (averaged over bins
+   with d ≥ 2, sink excluded, distinct tokens). Report the top 10 (layer, head) with their eval-split
+   values, and a heatmap of correlation per [layer, head].
+
+## Changes to Step 2
+
+1. **Add a recency baseline.** This is the key control for "attention vs. distance":
+   score(e) = Σ_{j<t} λ^(t−j) · 1[e ∈ E_j], with λ tuned on the selection split
+   (grid: 0.5, 0.7, 0.8, 0.9, 0.95, 0.99). Attention predictors must beat this to count.
+2. **Pre-gating, exact definition.** Input = residual stream entering layer l (output of layer l−1,
+   i.e. before layer l's attention). Apply layer l's `post_attention_layernorm` (in HF this is the
+   pre-MLP norm) and layer l's `mlp.gate`. Not defined for l = 0; report it as N/A there.
+3. **Combined predictor.** Combine z-scored pre-gating logits with z-scored attention scores, using the
+   mixing weight tuned on the selection split. Report the gain over pre-gating alone, with a bootstrap CI.
+4. **Also exclude j = 0** from attention-based scores (its expert set is a constant token's), and report
+   both versions for predictor A.
+5. Report recall on the eval split only, per layer and per domain, and an all-layer average excluding l = 0.
+
+## Process
+- Run on 10 sequences first, check the outputs make sense, then do the full run.
+- Push after Step 1 with a short `results/STEP1.md` (headline numbers + plots) and stop, so this can be
+  reviewed before Step 2.
