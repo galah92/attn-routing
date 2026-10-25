@@ -4,14 +4,13 @@ For token t at layer l every predictor scores the 64 experts; the prediction is 
 recall = |top-B ∩ E_t^l| / 8, averaged over tokens t in [T_MIN, n). Tokens' own layer-l routing is never
 used for t: history-based scores only read j < t (the attention diagonal j = t is dropped).
 
-Pass 1 (selection split): standalone predictors, to pick per layer the recency λ and the head set
-(top-3 vs. head-mean) of the attention predictors used in the combinations.
+Pass 1 (selection split): standalone predictors, to pick per layer the recency λ, the head set of A
+(Step 1 top-3 vs. head-mean) and the 3 heads of layer l-1 used by B (ranked by B's own per-head recall).
 Pass 2 (all sequences): standalone predictors plus z-scored combinations over a weight grid.
 Mixing weights are chosen per layer on the selection split; every reported number is eval split.
 """
 
 import argparse
-import itertools
 import json
 
 import matplotlib
@@ -30,19 +29,24 @@ LAMBDAS = [0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
 T_MIN = 2  # t = 0 has no history; t = 1 has only the sink j = 0
 N_BOOT = 1000
 RAW = RESULTS / "raw" / "step2_perseq.npz"
-W2 = np.round(np.linspace(0, 1, 11), 2)  # pair weight on the second component
-W3 = np.array([(a, b, round(1 - a - b, 2)) for a in W2 for b in W2 if a + b <= 1 + 1e-9])  # (wP, wR, wX)
+# Mixing-weight grid, dense near 0 where the tuned attention/recency weights land.
+WF = [0, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
+W2 = np.array(WF)  # pair weight on the second component
+W3 = np.array([(round(1 - r - x, 4), r, x) for r in WF for x in WF if r + x <= 1 + 1e-9])  # (wP, wR, wX)
 
 # Standalone predictors, in storage order. A = attention of layer l, B = attention of layer l-1.
 ATTN_VARIANTS = [f"{p}_{h}_{s}" for p in "AB" for h in ("top3", "mean") for s in ("nosink", "sink")]
 FIXED = ["oracle_router", "prev_token", "frequency", "pregate", *[f"recency_{x}" for x in LAMBDAS],
          *ATTN_VARIANTS]
-PAIRS = [("recency", "A"), ("pregate", "A"), ("recency", "B"), ("pregate", "B"), ("pregate", "recency")]
+PAIRS = [("recency", "A"), ("pregate", "A"), ("recency", "B"), ("pregate", "B")]
 TRIPLES = ["A", "B"]  # pregate + recency + {A, B}
 COMBO_KEYS = [f"{a}+{b}" for a, b in PAIRS] + [f"pregate+recency+{x}" for x in TRIPLES]
 
 
 def top3_heads():
+    """Top-3 heads per layer by Step 1's selection-split score (never the eval_score column)."""
+    crit = json.loads((RESULTS / "step1_best_heads.json").read_text())["criterion"]
+    assert crit.startswith("selection split"), crit
     h = pd.read_csv(RESULTS / "step1_heads.csv")
     h = h[h["head"] != "mean"].astype({"head": int})
     return {l: g.sort_values("sel_score", ascending=False)["head"].head(3).tolist()
@@ -53,15 +57,23 @@ def zscore(s):
     return (s - s.mean(-1, keepdim=True)) / (s.std(-1, keepdim=True) + 1e-12)
 
 
-def recall_at(scores, oh, tie):
-    """scores [..., n, E], oh [n, E] bool -> recall [..., len(BS)] averaged over t >= T_MIN."""
-    sc = scores[..., T_MIN:, :] + tie[T_MIN:]
-    tgt = oh[T_MIN:].expand(*scores.shape[:-2], -1, -1)
+def recall_at(scores, oh, freq=None):
+    """scores [..., n, E], oh [n, E] bool -> recall [..., len(BS)] averaged over t >= T_MIN.
+
+    With freq [n, E]: lexicographic ranking, by score and then, only among exactly equal scores, by
+    in-sequence frequency over j < t (two stable sorts). Without: plain topk per B (used for the oracle,
+    so bf16-tied logits resolve as in the router's own topk; topk orders ties differently for different
+    k, hence one topk per B rather than prefixes of a top-32)."""
+    sc = scores[..., T_MIN:, :]
+    tgt = oh[T_MIN:].expand_as(sc)
     k = oh[0].sum()  # top-k size (8)
-    # One topk per B (not prefixes of a top-32): topk orders tied values differently for different k,
-    # and bf16 router logits tie at the 8/9 boundary for ~2% of tokens.
-    return torch.stack([tgt.gather(-1, torch.topk(sc, b, dim=-1).indices).double().sum(-1).mean(-1)
-                        for b in BS], -1) / k
+    if freq is None:
+        return torch.stack([tgt.gather(-1, torch.topk(sc, b, dim=-1).indices).double().sum(-1).mean(-1)
+                            for b in BS], -1) / k
+    o1 = torch.sort(freq[T_MIN:].expand_as(sc), dim=-1, descending=True, stable=True).indices
+    o2 = torch.sort(sc.gather(-1, o1), dim=-1, descending=True, stable=True).indices
+    hits = tgt.gather(-1, o1.gather(-1, o2)[..., : max(BS)]).double().cumsum(-1)
+    return torch.stack([hits[..., b - 1].mean(-1) for b in BS], -1) / k
 
 
 def attn_scores(W, oh, sink):
@@ -74,15 +86,23 @@ def attn_scores(W, oh, sink):
     return W @ oh.double()
 
 
-def per_sequence(model, ids_row, heads, choice=None):
+def per_sequence(model, ids_row, heads, heads_b, choice=None):
+    """heads[l]: A's 3 heads of layer l. heads_b[l]: B's 3 heads of layer l-1 (for target layer l).
+    In pass 1 (choice None) also returns per-head recall of B for every head of layer l-1."""
     n = len(ids_row)
     L = model.config.num_hidden_layers
     E = model.config.num_experts
     hidx = {l: torch.tensor(heads[l], device="cuda") for l in range(L)}
+    bidx = {l - 1: torch.tensor(heads_b[l], device="cuda") for l in range(1, L)}
 
     def reduce(l, w):
-        w = w[0].double()
-        return {"mean": w.mean(0), "top3": w[hidx[l]].mean(0)}
+        w = w[0]
+        r = {"mean": w.double().mean(0), "top3": w[hidx[l]].double().mean(0)}
+        if l in bidx:
+            r["btop3"] = w[bidx[l]].double().mean(0)
+        if choice is None:
+            r["heads"] = w.float()
+        return r
 
     x = torch.tensor(ids_row[None], dtype=torch.long, device="cuda")
     with torch.no_grad(), capture(model, attn_fn=reduce, keep_layer_input=True) as rec:
@@ -101,15 +121,15 @@ def per_sequence(model, ids_row, heads, choice=None):
     dist = d[:, None] - d[None, :]
     Wrec = {lam: torch.where(dist > 0, lam ** dist.clamp(min=0), 0.0) for lam in LAMBDAS}
     fixed = np.full((L, len(FIXED), len(BS)), np.nan)
+    bhead = np.full((L, model.config.num_attention_heads, len(BS)), np.nan)
     combos = {}
     for l in range(L):
         ohl = oh[l]
         freq = tri @ ohl.double()  # counts over j < t
-        tie = 1e-12 * freq  # tie-break by in-sequence frequency; below any real score gap
         s = {
             "oracle_router": o.router_logits[l].double(),
-            "prev_token": torch.cat([torch.zeros(1, E, device="cuda", dtype=torch.float64),
-                                     ohl[:-1].double()]) + 1e-3 * freq / freq.sum(-1, keepdim=True).clamp(min=1),
+            # E_{t-1}; the frequency tie-break pads it to B
+            "prev_token": torch.cat([torch.zeros(1, E, device="cuda", dtype=torch.float64), ohl[:-1].double()]),
             "frequency": freq,
         }
         if l > 0:
@@ -124,30 +144,35 @@ def per_sequence(model, ids_row, heads, choice=None):
             la = l if src == "A" else l - 1
             if la < 0:
                 continue
-            att[v] = attn_scores(rec["attn"][la][hs], ohl, sk == "sink")
+            key = "btop3" if (src == "B" and hs == "top3") else hs
+            att[v] = attn_scores(rec["attn"][la][key], ohl, sk == "sink")
             s[v] = att[v]
         for i, k in enumerate(FIXED):
             if k in s:
-                # oracle: no tie-break, so bf16-tied logits resolve as in the router's own topk
-                fixed[l, i] = recall_at(s[k], ohl, 0 * tie if k == "oracle_router" else tie).cpu().numpy()
+                fixed[l, i] = recall_at(s[k], ohl, None if k == "oracle_router" else freq).cpu().numpy()
 
         if choice is None:
+            if l > 0:  # per-head B recall: each head of layer l-1 alone, sink excluded
+                bhead[l] = recall_at(attn_scores(rec["attn"][l - 1]["heads"].double(), ohl, False),
+                                     ohl, freq).cpu().numpy()
             continue
         c = choice[str(l)]
         z = {"recency": zscore(rec_s[c["lambda"]]), "A": zscore(att[f"A_{c['A_heads']}_nosink"])}
         if l > 0:
             z["pregate"] = zscore(pregate[l])
-            z["B"] = zscore(att[f"B_{c['B_heads']}_nosink"])
+            z["B"] = zscore(att["B_top3_nosink"])
         w2 = torch.tensor(W2, device="cuda", dtype=torch.float64)[:, None, None]
         for a, b in PAIRS:
             if a in z and b in z:
-                combos[(f"{a}+{b}", l)] = recall_at((1 - w2) * z[a] + w2 * z[b], ohl, tie).cpu().numpy()
+                combos[(f"{a}+{b}", l)] = recall_at((1 - w2) * z[a] + w2 * z[b], ohl, freq).cpu().numpy()
         w3 = torch.tensor(W3, device="cuda", dtype=torch.float64)[:, :, None, None]
         for xk in TRIPLES:
             if l > 0:
                 sc = w3[:, 0] * z["pregate"] + w3[:, 1] * z["recency"] + w3[:, 2] * z[xk]
-                combos[(f"pregate+recency+{xk}", l)] = recall_at(sc, ohl, tie).cpu().numpy()
+                combos[(f"pregate+recency+{xk}", l)] = recall_at(sc, ohl, freq).cpu().numpy()
     out = {"fixed": fixed}
+    if choice is None:
+        out["bhead"] = bhead
     if choice is not None:
         for k in COMBO_KEYS:
             G = len(W2) if k.count("+") == 1 else len(W3)
@@ -158,26 +183,30 @@ def per_sequence(model, ids_row, heads, choice=None):
     return out
 
 
-def run_pass(model, seqs, ids, heads, choice=None):
+def run_pass(model, seqs, ids, heads, heads_b, choice=None):
     outs = []
     for c, i in enumerate(seqs):
-        outs.append(per_sequence(model, ids[i], heads, choice))
+        outs.append(per_sequence(model, ids[i], heads, heads_b, choice))
         if c % 25 == 0:
             print(f"  seq {c + 1}/{len(seqs)}", flush=True)
     return {k: np.stack([o[k] for o in outs]) for k in outs[0]}
 
 
-def choose(fixed_sel, L):
-    """Per layer: λ and head sets maximizing mean recall over B on the selection split."""
-    m = np.nanmean(fixed_sel, 0).mean(-1)  # [L, NP]
+def choose(p1, L):
+    """Per layer, on the selection split (objective: mean recall over B): recency λ, A's head set
+    (Step 1 top-3 vs. head-mean), and B's 3 heads of layer l-1 ranked by B's own per-head recall."""
+    m = np.nanmean(p1["fixed"], 0).mean(-1)  # [L, NP]
+    bh = np.nanmean(p1["bhead"], 0).mean(-1)  # [L, H]
     ix = {k: i for i, k in enumerate(FIXED)}
-    choice = {}
+    choice, heads_b = {}, {}
     for l in range(L):
         lam = max(LAMBDAS, key=lambda x: m[l, ix[f"recency_{x}"]])
         a = max(["top3", "mean"], key=lambda h: m[l, ix[f"A_{h}_nosink"]])
-        b = max(["top3", "mean"], key=lambda h: m[l, ix[f"B_{h}_nosink"]]) if l > 0 else None
-        choice[str(l)] = {"lambda": lam, "A_heads": a, "B_heads": b}
-    return choice
+        choice[str(l)] = {"lambda": lam, "A_heads": a}
+        if l > 0:
+            heads_b[l] = [int(h) for h in np.argsort(-bh[l])[:3]]
+            choice[str(l)]["B_heads_of_prev_layer"] = heads_b[l]
+    return choice, heads_b, bh
 
 
 def collect(limit=None):
@@ -194,18 +223,23 @@ def collect(limit=None):
     L = model.config.num_hidden_layers
     check_pregate_wiring(model, ids[sel[0]])
     print(f"pass 1: {len(sel)} selection seqs")
-    p1 = run_pass(model, sel, ids, heads)
-    choice = choose(p1["fixed"], L)
+    # Pass 1: B's heads are not chosen yet; B_top3 here uses Step 1's heads of layer l-1 (unused later).
+    p1 = run_pass(model, sel, ids, heads, {l: heads[l - 1] for l in range(1, L)})
+    choice, heads_b, bh = choose(p1, L)
     seqs = sorted(sel + ev)
     print(f"pass 2: {len(seqs)} seqs")
-    raw = run_pass(model, seqs, ids, heads, choice)
+    raw = run_pass(model, seqs, ids, heads, heads_b, choice)
     raw["seq"] = np.array(seqs)
     raw["domain"] = domains[seqs]
     raw["is_sel"] = np.isin(seqs, sel)
     RAW.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(RAW, **raw)
     (RESULTS / "step2_choice.json").write_text(json.dumps(
-        {"criterion": "selection split, mean recall over B", "top3_heads": heads, "per_layer": choice}, indent=2))
+        {"criterion": "selection split, mean recall over B",
+         "A_top3_heads (Step 1 ranking)": heads,
+         "B_per_head_recall_selection (row = target layer l, col = head of layer l-1)":
+             np.round(bh, 4).tolist(),
+         "per_layer": choice}, indent=2))
     del model
     torch.cuda.empty_cache()
     return raw
@@ -258,8 +292,7 @@ def aggregate(raw=None):
     ix = {k: i for i, k in enumerate(FIXED)}
     preds["recency"] = np.stack([raw["fixed"][:, l, ix[f"recency_{choice[str(l)]['lambda']}"]] for l in range(L)], 1)
     preds["A_best"] = np.stack([raw["fixed"][:, l, ix[f"A_{choice[str(l)]['A_heads']}_nosink"]] for l in range(L)], 1)
-    preds["B_best"] = np.stack([raw["fixed"][:, l, ix[f"B_{choice[str(l)]['B_heads']}_nosink"]]
-                                if l > 0 else np.full((S, len(BS)), np.nan) for l in range(L)], 1)
+    preds["B_best"] = raw["fixed"][:, :, ix["B_top3_nosink"]]  # B's heads chosen by per-head recall
     for k in COMBO_KEYS:
         arr = raw[k]  # [S, L, G, B]
         obj = np.nanmean(arr[sel], 0).mean(-1)  # [L, G]
@@ -273,7 +306,7 @@ def aggregate(raw=None):
     obj = np.nanmean(arr[sel][:, :, noatt], 0).mean(-1)
     best = [int(noatt[np.nanargmax(obj[l])]) if np.isfinite(obj[l]).any() else 0 for l in range(L)]
     preds["pregate+recency(grid3)"] = np.stack([arr[:, l, best[l]] for l in range(L)], 1)
-    tuned["pregate+recency(grid3)"] = {l: W3[best[l]].tolist() for l in range(L)}
+    tuned["pregate+recency(grid3)"] = {l: (W3[best[l]].tolist() if l > 0 else None) for l in range(L)}
 
     # --- recall table: eval split, per domain, per layer + avg over l >= 1
     rows = []
@@ -450,15 +483,15 @@ def write_md(rec, gains, choice, tuned, L, n_ev, n_sel):
                         f"{x.gain.iloc[0]:+.4f} [{x.ci_lo.iloc[0]:+.4f}, {x.ci_hi.iloc[0]:+.4f}]")
         lines.append(f"| {l} | " + " | ".join(vals) + " |")
     lines += ["", "## Tuned parameters (selection split)", "",
-              "| layer | lambda | A heads | B heads | recency+A w_A | pregate+A w_A | pregate+recency+A (wP,wR,wA) | "
+              "| layer | lambda | A heads | B heads (of layer l-1) | recency+A w_A | pregate+A w_A | pregate+recency+A (wP,wR,wA) | "
               "pregate+recency+B (wP,wR,wB) | pregate+recency (wP,wR) |", "|---" * 9 + "|"]
     for l in range(L):
         c = choice[str(l)]
         t3a = tuned["pregate+recency+A"][l]
         t3b = tuned["pregate+recency+B"][l]
         t3 = tuned["pregate+recency(grid3)"][l]
-        lines.append(f"| {l} | {c['lambda']} | {c['A_heads']} | {c['B_heads']} | {tuned['recency+A'][l]} | "
-                     f"{tuned['pregate+A'][l]} | {t3a} | {t3b} | {t3[:2] if l > 0 else None} |")
+        lines.append(f"| {l} | {c['lambda']} | {c['A_heads']} | {c.get('B_heads_of_prev_layer')} | {tuned['recency+A'][l]} | "
+                     f"{tuned['pregate+A'][l]} | {t3a} | {t3b} | {t3[:2] if t3 else None} |")
     lines += ["", "![recall vs B](step2_recall_vs_B.png)", "", "![per layer](step2_recall_per_layer.png)", ""]
     (RESULTS / "STEP2_tables.md").write_text("\n".join(lines) + "\n")
 
