@@ -6,11 +6,14 @@
   share more experts than other pairs at the same distance. Within a distance bin, Spearman
   ρ(attention, expert overlap) is 0.13–0.27 in layers 2–15 (averaged over bins), with CIs of about
   ±0.01. Controlling for exact distance, removing repeated tokens and dropping the attention sink each
-  barely change it. As a predictor, attention beats tuned recency by +0.069 recall@8.
+  barely change it. As a predictor, same-layer attention (A) beats tuned recency by +0.069 recall@8.
+  Previous-layer attention (B), which has usable lead time, beats it by about +0.088 (0.522 vs. 0.434).
 - **Not supported in practice: attention as a prefetch signal.** Training-free pre-gating gets 0.875
   recall@8 (0.976 @16), against ~0.50 for attention. Added to pre-gating + recency, previous-layer
-  attention gains only **+0.0049 [+0.0046, +0.0052] recall@8** and **+0.0018 @16**. The gain is real,
-  positive in every layer and domain, but negligible. It is probably not worth computing and
+  attention gains only **+0.0049 [+0.0046, +0.0052] recall@8** and **+0.0018 @16**. The gain is real
+  but negligible:
+  - At B = 8 it is positive in every layer (all domains pooled) and in every domain (layer average).
+  - Per layer × domain it is often within noise of 0. It is probably not worth computing and
   transferring attention-derived scores for prefetch when pre-gating is available.
 
 All numbers come from the eval split (150 of 300 sequences), with 95% bootstrap CIs over sequences.
@@ -32,7 +35,8 @@ Everything tuned or selected used the other 150 sequences (the selection split).
   - math: `open-web-math/open-web-math`
 
   Each sequence is one document: `<|endoftext|>` plus its first 1023 tokens; shorter documents were
-  skipped. Data uses 1.2 MB on disk. The split is 50/50 selection/eval, stratified by domain, seed 0
+  skipped. That filter was strong: 100 were kept of 348 web, 190 code and 221 math documents scanned,
+  so the data is biased toward long documents. Data uses 1.2 MB on disk. The split is 50/50 selection/eval, stratified by domain, seed 0
   (`split.json`).
 - **Reproduce:** `python -m src.run_all` (data build if missing → split → Step 0 → Step 1 → Step 2). It
   takes 16.5 min on the L4 with data cached. Seeds are fixed, and the data build is deterministic
@@ -73,8 +77,8 @@ Everything tuned or selected used the other 150 sequences (the selection split).
 
 | layers | ρ, mean over bins d ≥ 2 | notes |
 |---|---|---|
-| 0–1 | 0.02–0.05 | signal only at d ≤ 2; layer 0 turns negative at long range (−0.10) |
-| 2–8 | 0.18–0.27 (peak: layer 5, 0.268) | peak at d = 2–4 (up to 0.36), still 0.12–0.21 at d = 513–1023 |
+| 0–1 | 0.02–0.05 | signal only at short range (d ≤ ~8), decaying to ~0; layer 0 turns negative at long range (−0.10) |
+| 2–8 | 0.18–0.27 (peak: layer 5, 0.268) | peak at d = 2–4 (up to 0.36), still 0.14–0.21 at d = 513–1023 |
 | 9–10 | 0.13–0.16 | |
 | 11–15 | 0.18–0.24 | |
 
@@ -82,20 +86,20 @@ Everything tuned or selected used the other 150 sequences (the selection split).
   averaged over bins. Single cells differ by ≤ 0.03.
 - **d = 1 is the blind spot:** at d = 1, ρ is weak or negative in middle layers (down to −0.13). Nearly
   every token attends heavily to its predecessor, so attention doesn't separate tokens there. Locality
-  carries that case (mean overlap 0.37–0.49 at d = 1).
+  carries that case (mean overlap 0.36–0.50 at d = 1 in layers 2–15).
 - **Controls barely matter:** same-token pairs are only 0.7–3.4% of pairs, and removing them lowers ρ
   by ~0.01. Excluding the sink barely changes pair-level ρ, because few sampled pairs have j = 0.
-- **Domains:** similar across domains. Code is slightly stronger in middle and late layers, and web is
-  the weakest.
+- **Domains:** similar across domains. Code is strongest in layers 8–13, math leads in layers 14–15,
+  and web is the weakest.
 - **Heads:** a handful of heads carry a stronger signal than the layer average, but most heads in
   layers 2–15 are positive.
   - Top heads, ranked on the selection split and scored on eval: 5.6 (0.350), 14.12 (0.350),
     6.2 (0.345), 5.3 (0.344), 2.2 (0.310).
-  - The best head beats its layer's head-mean by up to +0.14. In layers 11–13 no single head beats the
-    head-mean.
+  - The best head beats its layer's head-mean by up to +0.14. In layers 11–13 the best head is within
+    +0.02 of the head-mean.
   - Selection vs. eval head ranks agree almost perfectly (Spearman 0.999). That reflects stable head
     behaviour; the splits are disjoint documents, so it isn't leakage.
-  - Head 0.4 is strongly negative (−0.29).
+  - Head 0.4 is strongly negative (−0.25 [−0.27, −0.24]; −0.30 on web).
 
 ## Step 2: is attention useful for prefetch?
 recall@B = |top-B prediction ∩ true top-8| / 8. The table shows the eval split, all domains, averaged
@@ -109,10 +113,14 @@ is in `step2_recall.csv`.
 | prev-token | before token t | 0.425 [0.417, 0.434] | 0.637 [0.627, 0.650] |
 | recency (λ tuned) | before token t | 0.434 [0.422, 0.445] | 0.627 [0.615, 0.638] |
 | A: same-layer attention, head-mean | ≈ none | 0.474 [0.461, 0.487] | 0.683 [0.670, 0.695] |
-| A: same-layer attention, best heads | ≈ none | 0.503 [0.489, 0.515] | 0.708 [0.696, 0.720] |
+| A: same-layer attention, top-3 Step 1 heads | ≈ none | 0.501 [0.489, 0.514] | 0.704 [0.693, 0.715] |
+| A: head set chosen per layer (top-3 or mean) | ≈ none | 0.503 [0.489, 0.515] | 0.708 [0.696, 0.720] |
 | A, head-mean, sink included | ≈ none | 0.327 [0.311, 0.341] | 0.607 [0.591, 0.622] |
-| B: prev-layer attention, 3 heads | ~1 layer | 0.522 [0.509, 0.535] | 0.721 [0.710, 0.733] |
-| B, head-mean | ~1 layer | 0.472 | 0.680 |
+| A, top-3, sink included | ≈ none | 0.391 [0.376, 0.407] | 0.643 [0.628, 0.659] |
+| B: prev-layer attention, 3 recall-ranked heads | ~1 layer | 0.522 [0.509, 0.535] | 0.721 [0.710, 0.733] |
+| B, head-mean | ~1 layer | 0.472 [0.459, 0.485] | 0.680 [0.667, 0.692] |
+| B, 3 heads, sink included | ~1 layer | 0.438 [0.424, 0.451] | 0.672 [0.658, 0.685] |
+| B, head-mean, sink included | ~1 layer | 0.344 [0.329, 0.359] | 0.610 [0.594, 0.625] |
 | recency + A | ≈ none | 0.507 [0.495, 0.520] | 0.712 [0.700, 0.723] |
 | recency + B | ~1 layer | 0.525 [0.513, 0.538] | 0.725 [0.713, 0.737] |
 | **pre-gating** | layer l's attention block | **0.875 [0.873, 0.877]** | **0.976 [0.975, 0.976]** |
@@ -122,6 +130,10 @@ is in `step2_recall.csv`.
 | pre-gating + recency + A | ≈ none | 0.890 [0.888, 0.891] | 0.984 [0.983, 0.984] |
 | **pre-gating + recency + B** | layer l's attention block | **0.890 [0.889, 0.892]** | **0.984 [0.984, 0.984]** |
 | oracle (router logits, sanity check) | — | 1.000 | 1.000 |
+
+Pre-gating and B are undefined at layer 0, because there is no layer −1. They are reported as N/A there
+in `STEP2_tables.md`, which is why all averages cover layers 1–15. "Sink included" keeps the attention
+to j = 0 (a constant `<|endoftext|>` token). The main variants drop it and renormalize.
 
 **Does attention beat pre-gating?** No, by a wide margin: A − P = −0.373 [−0.388, −0.357] @8. This holds
 in every layer and domain; even code, where attention is strongest, gives −0.276.
@@ -142,10 +154,11 @@ over layers 1–15:
   - The gain is largest in early layers, where pre-gating is weakest (layers 1, 2, 4: pre-gating
     0.67–0.82, gain +0.010 to +0.014).
   - It is smallest in layers 12–14, where pre-gating is 0.94–0.95 @8 (gain +0.0003 to +0.0012).
-  - In practice, layer 1 is where attention could matter most: P+R+B gives 0.70 vs. 0.67 for
-    pre-gating.
+  - Layer 1 is where pre-gating is weakest (0.67). There, P+R+B gives 0.702, but most of that gap is
+    recency: P+R alone is 0.691, so attention's own term is +0.011.
 - **Sink handling is essential:** dropping j = 0 and renormalizing adds +0.148 recall@8 to head-mean A.
-  With the sink included, attention falls below recency.
+  With the sink included, both A variants fall below recency, and the best B variant only matches it
+  (0.438 vs. 0.434).
 - **Lead time:** the previous layer (B) is at least as good as the same layer (A), which has ≈ no
   usable lead. See the caveat on head selection under Limitations.
 
@@ -157,12 +170,12 @@ over layers 1–15:
   computing attention-weighted expert scores was not measured either.
 - **Linear z-score mixing on a grid, tuned per layer.** A learned combiner (e.g. a small model over
   pre-gating logits plus attention features) could extract more. The Step 1 correlations (ρ ≈ 0.2)
-  bound how much attention can add.
+  suggest the signal is modest, but they are not a formal bound on what attention can add.
 - **Head selection is not symmetric between A and B.**
   - A uses the Step 1 correlation ranking, as REVIEW.md specifies. B's heads are ranked by B's own
     recall, which was added after the independent review.
   - Part of B's +0.020 edge over A may come from that.
-  - The negative heads (e.g. 0.4, ρ = −0.29) were not used, per REVIEW.md. A signed or learned head
+  - The negative heads (e.g. 0.4, ρ = −0.25) were not used, per REVIEW.md. A signed or learned head
     weighting might help a little.
 - **Pre-gating's lead is short.** It only covers layer l's attention block, and the comparison is at
   that lead. At longer leads (2+ layers ahead) pre-gating is expected to degrade, and attention's
@@ -181,3 +194,26 @@ Report recall vs. k together with a simple offload simulator that tracks expert 
 time. If attention's unique contribution grows as pre-gating decays with k, attention could still earn
 a place in multi-layer-ahead prefetch. If it stays at ~0.5 points, the hypothesis can be closed for
 practical purposes.
+
+## Review fixes
+An independent subagent audited this report against TASK.md, REVIEW.md, the CLAUDE.md checklist and
+the result files. It found no leakage, no lead-time violations and no wrong headline numbers, and it
+recomputed the Step 2 table and gains from the CSVs. Fixes applied:
+- **Wrong numbers:**
+  - Head 0.4's score was −0.29; corrected to −0.25 here and in STEP1.md.
+  - The long-range ρ for layers 2–8 was 0.12–0.21; corrected to 0.14–0.21.
+  - The d = 1 overlap range was 0.37–0.49; corrected to 0.36–0.50.
+- **Over-broad claims made narrower:**
+  - "positive in every layer and domain" now says that per layer × domain the gain is often within
+    noise of 0.
+  - The layer 1 claim now separates recency's part from attention's own +0.011.
+  - The "ρ ≈ 0.2 bounds the gain" sentence is replaced: the correlations suggest a modest signal but
+    are not a bound.
+  - "No head beats the head-mean in layers 11–13" is now "the best head is within +0.02".
+  - The domain claim now says code is strongest in layers 8–13 and math in 14–15.
+  - "Signal only at d ≤ 2" for layers 0–1 is now "short range (d ≤ ~8)".
+- **Added:**
+  - A note that pre-gating and B are N/A at layer 0.
+  - Separate rows for A top-3 vs. the per-layer head choice, plus all sink-included A/B variants.
+  - B's +0.088 over recency, next to A's +0.069.
+  - The strength of the document-length filter (data bias toward long documents).

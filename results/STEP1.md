@@ -39,7 +39,7 @@ Values are mean ρ over bins with d ≥ 2.
   at d = 513–1023 in layers 2–15. Layer 0 turns negative at long range (−0.10).
 - **d = 1 is the exception:** ρ is weak or negative in layers 4 and 6–10 (as low as −0.13). Attention
   to the previous token is high for nearly every token, so it doesn't separate tokens with similar and
-  different routing. Here overlap is driven by plain locality (mean overlap 0.37–0.49 at d = 1), not
+  different routing. Here overlap is driven by plain locality (mean overlap 0.36–0.50 at d = 1 in layers 2–15), not
   by attention.
 - **Domains:** results are similar across domains. Code is slightly higher in middle and late layers
   (e.g. layer 9: web 0.10, code 0.23, math 0.17). Web is the weakest.
@@ -85,7 +85,7 @@ selection split; values shown are eval with 95% CI.
   heads). I checked this, and it isn't leakage. The splits are disjoint documents, and each head score
   averages ~10 bins × ~2000 pairs × 150 sequences. A head's behaviour is a stable property, so a
   near-perfect rank agreement is expected.
-- **Negative heads:** head 0.4 is strongly negative (−0.29), and a few layer-0/1 heads are mildly
+- **Negative heads:** head 0.4 is strongly negative (−0.25 on eval; −0.30 on web), and a few layer-0/1 heads are mildly
   negative. These heads attend to tokens whose routing differs, which might be useful as a negative
   feature later, but I haven't investigated it.
 
