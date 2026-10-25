@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+cache/
+hf_cache/
+*.pt
+*.safetensors
+*.npy
+*.npz
+*.bin
+results/raw/
