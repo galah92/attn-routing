@@ -8,17 +8,30 @@
   ±0.01. Controlling for exact distance, removing repeated tokens and dropping the attention sink each
   barely change it. As a predictor, same-layer attention (A) beats tuned recency by +0.069 recall@8.
   Previous-layer attention (B), which has usable lead time, beats it by about +0.088 (0.522 vs. 0.434).
-- **Not supported in practice: attention as a prefetch signal.** Training-free pre-gating gets 0.875
+- **Not supported in practice at one layer of lead (Step 2).** Training-free pre-gating gets 0.875
   recall@8 (0.976 @16), against ~0.50 for attention. Added to pre-gating + recency, previous-layer
   attention gains only **+0.0049 [+0.0046, +0.0052] recall@8** and **+0.0018 @16**. The gain is real
   but negligible:
   - At B = 8 it is positive in every layer (all domains pooled) and in every domain (layer average).
-  - Per layer × domain it is often within noise of 0. It is probably not worth computing and
-  transferring attention-derived scores for prefetch when pre-gating is available.
+  - Per layer × domain it is often within noise of 0. At this one-layer lead it is probably not
+  worth computing and transferring attention-derived scores for prefetch when pre-gating is
+  available.
+- **Weakly supported at longer lead (Step 3).** Predicting k = 1…4 layers ahead, pre-gating decays
+  (recall@8 0.903 → 0.685, layers 4–15) while attention stays flat (≈ 0.53–0.55). Attention's unique
+  gain over pre-gating + recency grows about 5× to **+0.0188 [+0.0178, +0.0198] recall@8 at k = 4**,
+  just under REVIEW.md's +0.02 threshold. In an LRU offload simulator it cuts misses by **14–18% vs.
+  pre-gating + recency at k = 4** (cache of 24–32 of 64 experts per layer), which meets the decision
+  rule as written. (Against P(k)+R the rule is formally met at every k, but at k ≤ 2 that is an
+  artefact of the reference's recency weight.) Against the strongest non-attention reference, the cut
+  is 9–15% at k = 4 (C = 24–32) and 11% at k = 3 (C = 32). In absolute terms that is ≈ 0.06 misses
+  per token per layer at k = 4, C = 24, vs. that reference (PRw(4); 0.09 vs. P(4)+R).
+  So the prefetch hypothesis stays open, but only for multi-layer-ahead prefetch with fairly large
+  caches. At k ≤ 2 attention adds little: against pre-gating alone its miss reduction is negative for
+  C ≤ 24 and at most 2.6% at C = 32.
 
 All numbers come from the eval split (150 of 300 sequences), with 95% bootstrap CIs over sequences.
 Everything tuned or selected used the other 150 sequences (the selection split). Per-step details:
-[`STEP0.md`](STEP0.md), [`STEP1.md`](STEP1.md), [`STEP2.md`](STEP2.md).
+[`STEP0.md`](STEP0.md), [`STEP1.md`](STEP1.md), [`STEP2.md`](STEP2.md), [`STEP3.md`](STEP3.md).
 
 ## Setup
 - **Model:** `allenai/OLMoE-1B-7B-0125`, bf16, eager attention, on a single L4. It has 16 layers, 64
@@ -38,10 +51,10 @@ Everything tuned or selected used the other 150 sequences (the selection split).
   skipped. That filter was strong: 100 were kept of 348 web, 190 code and 221 math documents scanned,
   so the data is biased toward long documents. Data uses 1.2 MB on disk. The split is 50/50 selection/eval, stratified by domain, seed 0
   (`split.json`).
-- **Reproduce:** `python -m src.run_all` (data build if missing → split → Step 0 → Step 1 → Step 2). It
-  takes 16.5 min on the L4 with data cached. Seeds are fixed, and the data build is deterministic
+- **Reproduce:** `python -m src.run_all` (data build if missing → split → Step 0 → Step 1 → Step 2 →
+  Step 3). Steps 0–2 take 16.5 min on the L4 with data cached, and Step 3 takes about 23 min more. Seeds are fixed, and the data build is deterministic
   (byte-identical on rebuild). A final end-to-end rerun reproduced every Step 1/2 CSV and JSON
-  byte-for-byte.
+  byte-for-byte. That rerun predates Step 3, so Step 3 was not part of it.
 
 ### Deviations and decisions
 - **Start token:** the tokenizer adds no BOS, so I prepend `<|endoftext|>`. Position 0 is therefore
@@ -162,12 +175,108 @@ over layers 1–15:
 - **Lead time:** the previous layer (B) is at least as good as the same layer (A), which has ≈ no
   usable lead. See the caveat on head selection under Limitations.
 
+## Step 3: matched lead time, k = 1…4, and an offload simulator
+Details: [`STEP3.md`](STEP3.md), tables in `STEP3_tables.md`.
+
+**Setup.**
+- **Lead k:** a predictor of token t's experts at layer l may use only what exists once layer l−k has
+  finished for token t, plus anything from earlier tokens.
+- **Predictors:**
+  - P(k) = residual after layer l−k → layer l's norm and gate.
+  - A(k) = layer l−k attention (sink excluded) × E_j^l. The top-3 heads of layer l−k are ranked by
+    A(k)'s own selection recall; top-3 beat the head-mean in every (k, l).
+  - R = recency.
+  - P(k)+R and P(k)+R+A(k), with weights tuned per (k, l) on the selection split.
+- **k = 1 check:** k = 1 reproduces Step 2's pre-gating, B and both combinations exactly (max |Δ| = 0
+  per sequence).
+- **Simulator:** an LRU cache per layer with C ∈ {16, 24, 32} of 64 experts. Before each token, the
+  predictor's top C/2 is prefetched. Misses and loads are counted over layers 4–15. One expert is
+  12.58 MB.
+
+**Recall vs. lead (eval, layers 4–15, same layers for every k):**
+
+| predictor | k=1 @8 | k=2 @8 | k=3 @8 | k=4 @8 | k=4 @16 |
+|---|---|---|---|---|---|
+| P(k) pre-gating | 0.903 | 0.822 | 0.753 | 0.685 | 0.865 |
+| A(k) attention | 0.534 | 0.528 | 0.544 | 0.549 | 0.751 |
+| R recency | 0.456 | 0.456 | 0.456 | 0.456 | 0.651 |
+| P(k)+R | 0.911 | 0.843 | 0.793 | 0.749 | 0.919 |
+| P(k)+R+A(k) | 0.914 | 0.850 | 0.807 | 0.768 | 0.932 |
+| **unique gain of A(k)** | **+0.0038 [+0.0036, +0.0041]** | **+0.0071 [+0.0067, +0.0075]** | **+0.0134 [+0.0126, +0.0142]** | **+0.0188 [+0.0178, +0.0198]** | +0.0130 [+0.0125, +0.0135] |
+
+- **CIs:** at @8 the half-widths are ±0.0015–0.0045 for P and the combinations and ±0.013 for A and R.
+  Every cell's CI is in `STEP3_tables.md`.
+- **Layer range:** the k = 1 column averages layers 4–15. Over all l ≥ 1 it equals Step 2 exactly:
+  pre-gating 0.875 and gain +0.0049 (`avg_defined` in `STEP3_tables.md`).
+
+![recall vs k](step3_recall_vs_k.png)
+
+- Attention's information does not decay with lead, pre-gating's does (≈ −0.07 recall@8 per layer).
+  So attention's unique contribution grows with k.
+- At k = 4 even attention alone is still far below pre-gating (−0.136 @8), except in code (−0.026).
+- **By domain (@8):**
+  - k = 4: code +0.0238, math +0.0190, web +0.0135.
+  - k = 2: code +0.0084, math +0.0074, web +0.0054.
+  - The order is the same at every k.
+- **Per layer:**
+  - k = 2: +0.021 in layer 3 (the only layer above +0.02), +0.010 to +0.019 in layers 2–7, and
+    +0.001 to +0.007 in layers 8–15.
+  - k = 4: above +0.02 in layers 4–7, 9 and 10 (max +0.037 in layer 5), and +0.004 to +0.015
+    elsewhere.
+
+**Offload simulator (misses per token per layer, of 8; eval, layers 4–15):**
+
+| predictor | C = 16 | C = 24 | C = 32 | experts moved per token, C = 24 | MB per token, C = 24 |
+|---|---|---|---|---|---|
+| no prefetch (LRU) | 2.94 | 1.92 | 1.19 | 23.1 | 291 |
+| R | 2.79 | 1.83 | 1.14 | 22.0 | 277 |
+| A(4) | 2.30 | 1.43 | 0.87 | 29.4 | 369 |
+| P(1) | 0.40 | 0.066 | 0.017 | 51.8 | 651 |
+| P(4) | 1.24 | 0.63 | 0.34 | 65.7 | 826 |
+| P(4)+R | 1.35 | 0.65 | 0.34 | 45.5 | 572 |
+| PRw(4): P(4)+R at P+R+A's weights | 1.26 | 0.61 | 0.33 | 55.3 | 695 |
+| P(4)+R+A(4) | 1.23 | 0.55 | 0.28 | 44.0 | 554 |
+
+Experts moved are summed over the 12 simulated layers. All predictors, every k and C, with CIs, are in
+`STEP3_tables.md`. Attention alone (A(4)) is cheap in bytes but weak in misses.
+
+![simulator](step3_sim.png)
+
+- **Prefetch trades bytes for misses.** It cuts misses many-fold but moves 2–3× more experts than
+  LRU alone, because most prefetched experts go unused.
+- **Recall is not the cache objective.** Recency only re-ranks experts that are already resident, so
+  P(k)+R has more misses than P(k) despite higher recall. The review flagged that this makes P(k)+R a
+  weak reference. So STEP3.md also compares against PRw(k) and the best non-attention reference.
+- **Attention's miss reduction (1 − misses_PRA / misses_ref):**
+  - vs. P(k)+R: 14.3% at k = 4, C = 24 and 18.0% at C = 32.
+  - vs. the best non-attention reference: 9.4% at k = 4, C = 24, 14.6% at k = 4, C = 32 and 10.9% at
+    k = 3, C = 32.
+  - At k ≤ 2 it is worse than P(k) for C ≤ 24, and at most 2.6% better at C = 32.
+
+**Decision rule (REVIEW.md):** attention is worth pursuing if, at some k ≤ 4, (a) its unique gain is
+≥ +0.02 recall@8 with the CI excluding 0, or (b) it cuts simulated misses by ≥ 10% relative to P(k)+R.
+- (a) is not met: +0.0188, upper CI bound 0.0198.
+- (b) is met as written at every k ≤ 4 for C ≥ 24 (k = 1: 13.5% / 17.1%; k = 2: 11.7% at C = 32;
+  k = 3: 12.9% / 16.8%; k = 4: 14.3% / 18.0%).
+- At k ≤ 2 this is discounted. P(k)+R's recency weight spends prefetch slots on experts that are
+  already resident, and against P(k) alone the effect vanishes: it is negative at C ≤ 24 and at
+  most 2.6% at C = 32.
+- Under the stricter reference (best of P, P+R and PRw), (b) holds at C = 32 for k = 3 (10.9%) and
+  k = 4 (14.6%), and narrowly misses at k = 4, C = 24 (9.4%).
+- **So by the rule, read with the stricter reference, attention is worth pursuing for
+  multi-layer-ahead prefetch (k ≥ 3) only.** The effect is modest and partly sensitive to the choice
+  of reference.
+
 ## Limitations
 - **One model, one context length, prefill-style teacher forcing.** Decode is equivalent here by
   causality, but there are no batching effects and no long contexts (> 1024 tokens).
-- **Recall is not latency.** I did not measure bytes transferred, prefetch timing or cache policies.
-  A +0.005 recall gain could matter only in a severely bandwidth-bound setup, and the cost of
-  computing attention-weighted expert scores was not measured either.
+- **Recall is not latency.** Step 3's simulator counts misses and bytes for one simple policy:
+  - per-layer LRU, with a fixed prefetch of C/2 experts every token;
+  - no transfer/compute overlap, stall time or PCIe bandwidth model;
+  - no measurement of the cost of computing attention-weighted expert scores.
+
+  All mixing weights were tuned for recall, not misses. A miss-tuned or cost-aware prefetch policy
+  could change the ranking of predictors.
 - **Linear z-score mixing on a grid, tuned per layer.** A learned combiner (e.g. a small model over
   pre-gating logits plus attention features) could extract more. The Step 1 correlations (ρ ≈ 0.2)
   suggest the signal is modest, but they are not a formal bound on what attention can add.
@@ -177,25 +286,59 @@ over layers 1–15:
   - Part of B's +0.020 edge over A may come from that.
   - The negative heads (e.g. 0.4, ρ = −0.25) were not used, per REVIEW.md. A signed or learned head
     weighting might help a little.
-- **Pre-gating's lead is short.** It only covers layer l's attention block, and the comparison is at
-  that lead. At longer leads (2+ layers ahead) pre-gating is expected to degrade, and attention's
-  relative value may grow; this was not measured.
+- **Pre-gating's lead in Step 2 is short.** It only covers layer l's attention block. Step 3 measured
+  longer leads (k ≤ 4); beyond k = 4 was not tested.
+- **The Step 3 reference matters.** The decision rule's P(k)+R reference is weakened in the simulator
+  by its recency weight. The conclusion is stated against both it and a stricter reference, chosen
+  post hoc on eval misses (which is conservative for attention).
 - **bf16 ties at the router's 8/9 boundary** (~2% of tokens) make the ground-truth set itself slightly
   arbitrary at that margin.
 
 ## Suggested next experiment
-**Matched lead-time comparison at longer horizons.** Predict layer l's experts from layer l−k for
-k = 1…4:
-- pre-gating: the residual after layer l−k, through layer l's norm and gate;
-- attention: layer l−k attention × E_j^l, j < t, with heads selected per (k, l) on the selection split;
-- their tuned combination.
+Step 3 ran the previously suggested matched lead-time comparison. Attention's value shows up only at
+k ≥ 3, and mainly in cache misses, not recall. The next experiment should therefore optimize and
+measure the cache directly:
+1. **Tune for misses, not recall.** Choose the prefetch weights (P, R, A) and the prefetch size
+   (C/2 here) per (k, layer) on the selection split by simulated misses or bytes moved. Include a
+   "don't prefetch already-resident experts" rule and an adaptive prefetch size (prefetch only above
+   a score threshold), and compare P(k)-only against P(k)+A(k) under that tuning.
+2. **Model time, not just counts.** Add PCIe bandwidth and per-layer compute time (e.g. measured on
+   the L4) to turn misses and bytes into stall time. That shows whether k = 3–4 prefetch with attention
+   beats k = 1–2 prefetch with pre-gating alone at equal bytes moved.
+3. **Extend k beyond 4** and repeat on a second MoE (e.g. Mixtral-style top-2 routing). With fewer
+   active experts per token, a few extra correct predictions might matter more (untested).
 
-Report recall vs. k together with a simple offload simulator that tracks expert bytes moved and stall
-time. If attention's unique contribution grows as pre-gating decays with k, attention could still earn
-a place in multi-layer-ahead prefetch. If it stays at ~0.5 points, the hypothesis can be closed for
-practical purposes.
+If attention's miss reduction against the best non-attention reference stays below 10% under
+miss-tuned weights, close the hypothesis.
 
 ## Review fixes
+### Step 3 update
+A fresh independent subagent reviewed the Step 3 additions (verdict, Step 3 section, Limitations, next
+experiment) against REVIEW.md, the CLAUDE.md checklist and the Step 3 result files. It found no wrong
+numbers and no leakage or lead-time misstatements. Fixes applied:
+- **Decision rule (b), selective reporting:** the report now states that (b) is met as written at
+  every k ≤ 4 for C ≥ 24, explains why k ≤ 2 is discounted, and says the conclusion relies on the
+  stricter reference.
+- **Verdict wording:**
+  - "At k ≤ 2 pre-gating alone is as good or better" is now quantified (miss reduction negative at
+    C ≤ 24, at most 2.6% at C = 32).
+  - The Step 2 "not worth computing" sentence is now scoped to the one-layer lead.
+  - The C range and the reference for the k = 4 numbers are now stated.
+- **Missing Step 3 requirements added to the report:**
+  - per-domain and per-layer results at k = 2;
+  - CIs for the gain at every k and the CI half-widths for recall;
+  - links to both Step 3 plots;
+  - an experts-moved column, plus R and A(4) rows, in the simulator table.
+- **Clarity:**
+  - Explained why the k = 1 column (layers 4–15) differs from Step 2's headline (layers 1–15), and
+    that it matches over l ≥ 1.
+  - Noted that the end-to-end byte-identical rerun predates Step 3.
+- **Nits:**
+  - Renamed "prefetch size B" to avoid a clash with predictor B and the recall budget.
+  - Softened an untested claim in the next experiment.
+  - Synced three CIs in STEP3.md with the tables.
+
+### Final report (Step 2 version)
 An independent subagent audited this report against TASK.md, REVIEW.md, the CLAUDE.md checklist and
 the result files. It found no leakage, no lead-time violations and no wrong headline numbers, and it
 recomputed the Step 2 table and gains from the CSVs. Fixes applied:
