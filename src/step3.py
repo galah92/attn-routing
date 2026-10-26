@@ -10,6 +10,9 @@ finished for token t, plus anything from tokens j < t at any layer.
   R       recency, lambda per layer from Step 2 (selection split); independent of k.
   PR(k), PRA(k)  z-scored P(k)+R and P(k)+R+A(k), weights per (k, l) on Step 2's triple grid
           (PR(k) = the w_A = 0 subset of the same grid).
+  PRw(k)  control: P(k)+R at PRA(k)'s (w_P, w_R) with w_A = 0, i.e. PRA(k) minus its attention term. PRA(k)
+          is usually tuned with less recency than PR(k), and in the cache simulator recency spends prefetch
+          slots on already-resident experts, so PRA - PRw isolates attention's information from that.
 
 Pass 1 (selection): per-head recall of A(k) -> top-3 heads per (k, l).
 Pass 2 (selection): standalone recall of both head variants + the full weight grid -> choices.
@@ -41,7 +44,7 @@ NOATT = np.where(W3[:, 2] == 0)[0]
 TOPM = 16  # ranks kept for the simulator (B = C/2 <= 16)
 CS = [16, 24, 32]
 EXPERT_MB = 3 * 2048 * 1024 * 2 / 1e6  # one OLMoE expert in bf16 (gate, up, down), MB
-SIM_PREDS = ["none", "R", *[f"{p}{k}" for k in KS for p in ("P", "A", "PR", "PRA")]]
+SIM_PREDS = ["none", "R", *[f"{p}{k}" for k in KS for p in ("P", "A", "PR", "PRA", "PRw")]]
 
 
 def ranked(scores, freq, m=TOPM):
@@ -93,7 +96,7 @@ def per_sequence(model, ids_row, lams, heads=None, cfg=None, final=False):
     if heads is not None and cfg is None:
         out["grid"] = np.full((nK, L, 2, len(W3), nB), np.nan)
     if final:
-        out["combo"] = np.full((nK, L, 2, nB), np.nan)  # PR, PRA at the chosen weights
+        out["combo"] = np.full((nK, L, 3, nB), np.nan)  # PR, PRA, PRw at the chosen weights
         out["ranks"] = {p: np.full((L, n, TOPM), -1, dtype=np.int8) for p in SIM_PREDS[1:]}
         out["true"] = torch.stack([experts[l] for l in range(L)]).to(torch.int8).cpu().numpy()  # [L, n, 8]
     w3 = torch.tensor(W3, device="cuda", dtype=torch.float64)[:, :, None, None]
@@ -131,8 +134,9 @@ def per_sequence(model, ids_row, lams, heads=None, cfg=None, final=False):
             zA = zscore(s[f"A_{c['heads']}"])
             pr = c["w_PR"][0] * zP + c["w_PR"][1] * zR
             pra = c["w_PRA"][0] * zP + c["w_PRA"][1] * zR + c["w_PRA"][2] * zA
-            out["combo"][ki, l] = torch.stack([recall_at(pr, ohl, freq), recall_at(pra, ohl, freq)]).cpu().numpy()
-            for p, sc in (("P", s["P"]), ("A", s[f"A_{c['heads']}"]), ("PR", pr), ("PRA", pra)):
+            prw = c["w_PRA"][0] * zP + c["w_PRA"][1] * zR
+            out["combo"][ki, l] = torch.stack([recall_at(x, ohl, freq) for x in (pr, pra, prw)]).cpu().numpy()
+            for p, sc in (("P", s["P"]), ("A", s[f"A_{c['heads']}"]), ("PR", pr), ("PRA", pra), ("PRw", prw)):
                 out["ranks"][f"{p}{k}"][l] = ranked(sc, freq).to(torch.int8).cpu().numpy()
     return out
 
@@ -232,7 +236,8 @@ def simulate(true, ranks, C, B):
     ones are only touched), then touch the resident true experts (hits), then load the missing ones
     (misses). A load into a full cache evicts the least recently used expert. The true experts are touched
     before any miss is loaded, so a miss load can never evict another of the same token's experts.
-    Returns per-row totals: prefetch loads, misses (= on-miss loads)."""
+    Returns per-row totals over t >= T_MIN (as for recall; earlier tokens still run, to warm the cache):
+    prefetch loads, misses (= on-miss loads)."""
     N, n, k = true.shape
     ts = np.full((N, 64), -1, dtype=np.int64)  # last-use clock; -1 = not resident
     cnt = np.zeros(N, dtype=np.int64)
@@ -262,7 +267,8 @@ def simulate(true, ranks, C, B):
                 res = ts[ar, e] >= 0
                 ts[ar[res], e[res]] = clock  # touch
                 load(e, ~res)
-                pre += ~res
+                if t >= T_MIN:
+                    pre += ~res
         e_t = true[:, t].astype(np.int64)
         res = ts[ar[:, None], e_t] >= 0  # [N, 8]
         for j in range(k):
@@ -270,7 +276,8 @@ def simulate(true, ranks, C, B):
             clock += 1
         for j in range(k):
             load(e_t[:, j], ~res[:, j])
-        miss += (~res).sum(1)
+        if t >= T_MIN:
+            miss += (~res).sum(1)
     return pre, miss
 
 
@@ -344,7 +351,7 @@ def predictors(raw, choice):
     A = np.where(sel[None, :, :, None] == 0, st[:, :, :, 1], st[:, :, :, 2])
     R = np.repeat(raw["R"][:, None], K, 1)
     return {"P": st[:, :, :, 0], "A": A, "A_top3": st[:, :, :, 1], "A_mean": st[:, :, :, 2], "R": R,
-            "PR": cb[:, :, :, 0], "PRA": cb[:, :, :, 1]}
+            "PR": cb[:, :, :, 0], "PRA": cb[:, :, :, 1], "PRw": cb[:, :, :, 2]}
 
 
 def aggregate(raw=None):
@@ -383,6 +390,7 @@ def aggregate(raw=None):
     rec.to_csv(RESULTS / "step3_recall.csv", index=False, float_format="%.4f")
 
     comps = [("PRA", "PR", "attention's unique gain: PRA(k) - PR(k)"),
+             ("PRA", "PRw", "attention term at PRA's own weights: PRA(k) - PRw(k)"),
              ("PR", "P", "recency adds to pre-gating: PR(k) - P(k)"),
              ("A", "R", "attention alone vs recency: A(k) - R"),
              ("A", "P", "attention vs pre-gating: A(k) - P(k)"),
@@ -404,6 +412,7 @@ def aggregate(raw=None):
     srows = []
     nl = len(layers)
     base = {}
+    n -= T_MIN  # tokens counted
     for (p, C), (pre, miss) in sim.items():
         miss_tl = miss.sum(1) / (n * nl)  # per seq: misses per token per layer
         moved_t = (pre + miss).sum(1) / n  # per seq: experts moved per token, summed over layers
@@ -416,16 +425,19 @@ def aggregate(raw=None):
             srows.append(dict(predictor=p, C=C, B=C // 2 if p != "none" else 0, metric=name,
                               value=mean, ci_lo=lo, ci_hi=hi))
         base[p, C] = miss.sum(1)
-    # Relative miss reduction of PRA(k) vs PR(k) (the decision rule's reference) and vs P(k) (which can have
-    # fewer misses than PR(k)); ratio of totals over sequences, bootstrap CI.
+    # Relative miss reduction of PRA(k) vs PR(k) (the decision rule's reference), vs P(k) and PRw(k) (which can
+    # have fewer misses than PR(k)), and vs "best": whichever of the three has the fewest eval misses in that
+    # (k, C) cell (conservative). Ratio of totals over sequences, bootstrap CI.
     for C in CS:
         for k in KS:
-            for ref in ("PR", "P"):
-                a, b = base[f"PRA{k}", C], base[f"{ref}{k}", C]
+            best = min(("P", "PR", "PRw"), key=lambda r: base[f"{r}{k}", C].sum())
+            for ref in ("PR", "P", "PRw", "best"):
+                a, b = base[f"PRA{k}", C], base[f"{best if ref == 'best' else ref}{k}", C]
                 idx = rng.integers(0, S, (1000, S))
                 lo, hi = np.percentile(1 - a[idx].sum(1) / b[idx].sum(1), [2.5, 97.5])
                 srows.append(dict(predictor=f"PRA{k} vs {ref}{k}", C=C, B=C // 2, metric="relative_miss_reduction",
-                                  value=1 - a.sum() / b.sum(), ci_lo=lo, ci_hi=hi))
+                                  value=1 - a.sum() / b.sum(), ci_lo=lo, ci_hi=hi,
+                                  ref=f"{best}{k}" if ref == "best" else f"{ref}{k}"))
     simdf = pd.DataFrame(srows)
     simdf.to_csv(RESULTS / "step3_sim.csv", index=False, float_format="%.4f")
 
@@ -473,7 +485,7 @@ def plots(rec, gains, simdf):
         sc = s[s.C == C].set_index("predictor")
         ax.axhline(sc.loc["none"].value, color="gray", ls=":", label="no prefetch (LRU)")
         ax.axhline(sc.loc["R"].value, color="C2", ls="--", label="R")
-        for i, (p, lab) in enumerate(LINES):
+        for i, (p, lab) in enumerate(LINES + [("PRw", "P(k)+R at PRA's weights")]):
             if p == "R":
                 continue
             ax.plot(KS, [sc.loc[f"{p}{k}"].value for k in KS], marker="o", color=f"C{i}", label=lab)
@@ -502,7 +514,7 @@ def write_md(rec, gains, simdf, chk, choice, S, L):
         lines += ["", f"## Recall vs k, all domains, {avg}", "",
                   "| predictor | " + " | ".join(f"k={k} @8" for k in KS) + " | " + " | ".join(f"k={k} @16" for k in KS) + " |",
                   "|---" * 9 + "|"]
-        for p, lab in LINES + [("A_top3", "A_top3(k)"), ("A_mean", "A_mean(k)")]:
+        for p, lab in LINES + [("PRw", "PRw(k): P(k)+R at PRA's weights"), ("A_top3", "A_top3(k)"), ("A_mean", "A_mean(k)")]:
             vals = [_ci(r[(r.predictor == p) & (r.k == k) & (r.layer == avg) & (r.B == B)].iloc[0])
                     for B in (8, 16) for k in KS]
             lines.append(f"| {lab} | " + " | ".join(vals) + " |")
@@ -525,7 +537,7 @@ def write_md(rec, gains, simdf, chk, choice, S, L):
                 vals.append(_ci(x, "gain", "+.4f"))
             c = choice[f"{k},{l}"]
             lines.append(f"| {l} | " + " | ".join(vals) + f" | {c['heads']} | {c['w_PRA']} |")
-    lines += ["", f"## Offload simulator (eval, layers {L0}-15, LRU per layer, B = C/2; expert = {EXPERT_MB:.2f} MB)", "",
+    lines += ["", f"## Offload simulator (eval, layers {L0}-15, tokens t >= {T_MIN}, LRU per layer, B = C/2; expert = {EXPERT_MB:.2f} MB)", "",
               "| predictor | C | misses / token / layer | experts moved / token | of which prefetched | MB / token |",
               "|---|---|---|---|---|---|"]
     for C in CS:
@@ -536,11 +548,14 @@ def write_md(rec, gains, simdf, chk, choice, S, L):
                          f"{x.loc['prefetched_per_token'].value:.2f} | {_ci(x.loc['MB_per_token'], 'value', '.0f')} |")
     lines += ["", "## Relative miss reduction of PRA(k) (1 - misses_PRA / misses_ref)", "",
               "| reference | C | " + " | ".join(f"k={k}" for k in KS) + " |", "|---" * (len(KS) + 2) + "|"]
-    for ref in ("PR", "P"):
+    for ref in ("PR", "P", "PRw", "best"):
         for C in CS:
             x = simdf[(simdf.metric == "relative_miss_reduction") & (simdf.C == C)]
-            lines.append(f"| {ref}(k) | {C} | " + " | ".join(
-                _ci(x[x.predictor == f"PRA{k} vs {ref}{k}"].iloc[0], "value", "+.4f") for k in KS) + " |")
+            cells = []
+            for k in KS:
+                v = x[x.predictor == f"PRA{k} vs {ref}{k}"].iloc[0]
+                cells.append(_ci(v, "value", "+.4f") + (f" ({v.ref})" if ref == "best" else ""))
+            lines.append(f"| {ref}(k) | {C} | " + " | ".join(cells) + " |")
     lines += ["", "![recall vs k](step3_recall_vs_k.png)", "", "![simulator](step3_sim.png)", ""]
     (RESULTS / "STEP3_tables.md").write_text("\n".join(lines) + "\n")
 
